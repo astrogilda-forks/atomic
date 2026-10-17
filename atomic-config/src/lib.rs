@@ -576,11 +576,49 @@ pub struct GitShimConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Whether `.vault/` participates in the shim's repository-manifest
+    /// projection (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §6.2 "Excluded paths":
+    /// "`.vault/` is private by default but may be tracked under explicit
+    /// policy"). An omitted value remains undecided: the shim resolves it
+    /// from Git's tracked tree, using private vault behavior when Git does
+    /// not track `.vault/`. Saving unrelated configuration must not turn an
+    /// omitted policy into explicit consent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<ShimVaultPolicy>,
+
     /// The optional metadata-only shim watch daemon (RFC §11.2, CB-13D).
     /// Defaults to disabled; an absent `[git.shim.watch]` section reads
     /// as fully disabled.
     #[serde(default)]
     pub watch: ShimWatchConfig,
+}
+
+/// Whether the colocated shim projects `.vault/` into the repository
+/// manifest.
+///
+/// `private` (default): `.vault/` is shim-private state, excluded from
+/// the manifest projection — the vault is Atomic-owned and never enters
+/// Git equivalence proofs or publications. This is the policy for a
+/// repository whose Git tree does not track `.vault/`.
+///
+/// `tracked`: Git tracks `.vault/` in this repository, so the vault joins
+/// the manifest projection and every equivalence, checkpoint, and
+/// publication comparison covers it exactly like any other tracked path.
+/// A projection that silently lacked a Git-tracked `.vault/` could never
+/// verify against the raw Git tree, and publishing it would delete the
+/// vault from Git.
+///
+/// ```toml
+/// [git.shim]
+/// vault = "tracked"
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ShimVaultPolicy {
+    #[default]
+    #[serde(rename = "private")]
+    Private,
+    #[serde(rename = "tracked")]
+    Tracked,
 }
 
 /// Configuration for the optional metadata-only shim watch daemon
@@ -1080,6 +1118,36 @@ impl RepoConfig {
         Ok(toml::from_str(&content)?)
     }
 
+    /// Load the repository configuration and report whether the shim
+    /// vault policy (`[git.shim] vault`) was explicitly recorded, as
+    /// opposed to defaulted by omission in a configuration written before
+    /// the field existed.
+    ///
+    /// The distinction matters: an explicit record is a decision (the
+    /// importer's first-import record, or a user's override) and wins; an
+    /// omitted field is "undecided" and callers fall back to detection.
+    /// Read and parse failures propagate — a corrupt configuration must
+    /// fail closed, never silently change the resolved policy.
+    pub fn load_with_vault_recorded(path: &std::path::Path) -> Result<(Self, bool), ConfigError> {
+        if !path.exists() {
+            return Ok((Self::default(), false));
+        }
+
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        let value: toml::Value = toml::from_str(&content)?;
+        let recorded = value
+            .get("git")
+            .and_then(|git| git.get("shim"))
+            .and_then(|shim| shim.get("vault"))
+            .is_some();
+        let config: Self = toml::from_str(&content)?;
+        Ok((config, recorded))
+    }
+
     /// Save repository configuration to a specific path.
     ///
     /// Atomic replacement (write a same-directory temporary, fsync, rename
@@ -1164,6 +1232,7 @@ mod tests {
             git: GitConfig {
                 shim: GitShimConfig {
                     enabled: true,
+                    vault: Some(ShimVaultPolicy::Tracked),
                     watch: ShimWatchConfig {
                         enabled: true,
                         quiet_ms: 500,
@@ -1176,6 +1245,7 @@ mod tests {
         let encoded = toml::to_string_pretty(&config).unwrap();
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.git.shim.watch, config.git.shim.watch);
+        assert_eq!(decoded.git.shim.vault, Some(ShimVaultPolicy::Tracked));
     }
 
     #[test]
@@ -1224,6 +1294,93 @@ mod tests {
             config.git.shim.default_enablement(),
             Err(DefaultEnablementRefusal::NotOptedIn)
         );
+    }
+
+    /// An omitted policy is undecided; shim enablement is not a vault-policy choice.
+    #[test]
+    fn git_shim_vault_defaults_to_private() {
+        let config: RepoConfig = toml::from_str("").unwrap();
+        assert_eq!(config.git.shim.vault, None);
+        // The explicit opt-in must not silently flip the vault policy.
+        let config: RepoConfig = toml::from_str("[git.shim]\nenabled = true\n").unwrap();
+        assert_eq!(config.git.shim.vault, None);
+    }
+
+    /// RFC §6.2: a colocated repository may record `tracked`.
+    #[test]
+    fn git_shim_vault_parses_and_round_trips() {
+        let config: RepoConfig = toml::from_str("[git.shim]\nvault = \"tracked\"\n").unwrap();
+        assert_eq!(config.git.shim.vault, Some(ShimVaultPolicy::Tracked));
+        assert!(!config.git.shim.enabled, "other fields keep their defaults");
+
+        let text = toml::to_string(&config).unwrap();
+        let reloaded: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.git.shim.vault, Some(ShimVaultPolicy::Tracked));
+    }
+
+    /// An unknown vault policy value refuses instead of guessing.
+    #[test]
+    fn git_shim_vault_rejects_unknown_values() {
+        let result: Result<RepoConfig, _> = toml::from_str("[git.shim]\nvault = \"maybe\"\n");
+        assert!(result.is_err());
+    }
+
+    /// `load_with_vault_recorded` distinguishes an explicit record from a
+    /// configuration written before the field existed.
+    #[test]
+    fn load_with_vault_recorded_reports_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Absent file: defaulted, not recorded.
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(!recorded);
+        assert_eq!(config.git.shim.vault, None);
+
+        // Omitted field (pre-policy configuration): not recorded.
+        std::fs::write(&path, "[git.shim]\nenabled = true\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(!recorded, "an omitted vault field is undecided");
+        assert_eq!(config.git.shim.vault, None);
+        assert!(config.git.shim.enabled);
+
+        // Explicit record: recorded, both directions.
+        std::fs::write(&path, "[git.shim]\nvault = \"tracked\"\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(config.git.shim.vault, Some(ShimVaultPolicy::Tracked));
+
+        std::fs::write(&path, "[git.shim]\nvault = \"private\"\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(config.git.shim.vault, Some(ShimVaultPolicy::Private));
+
+        // A corrupt configuration fails closed instead of defaulting.
+        std::fs::write(&path, "not [ valid toml").unwrap();
+        assert!(RepoConfig::load_with_vault_recorded(&path).is_err());
+    }
+
+    #[test]
+    fn saving_shim_settings_preserves_an_omitted_vault_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = RepoConfig::default();
+        config.git.shim.enabled = true;
+        config.save(&path).unwrap();
+
+        let (loaded, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(loaded.git.shim.enabled);
+        assert_eq!(loaded.git.shim.vault, None);
+        assert!(
+            !recorded,
+            "saving unrelated settings must not invent an explicit vault policy"
+        );
+
+        config.git.shim.vault = Some(ShimVaultPolicy::Private);
+        config.save(&path).unwrap();
+        let (loaded, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(loaded.git.shim.vault, Some(ShimVaultPolicy::Private));
     }
 
     /// Explicit opt-in parses, and default enablement is still refused
