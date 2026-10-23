@@ -140,12 +140,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The ai-agent-action suite from agent-evidence-vectors, pinned to a
-      # release tag. Raise the tag to take the vectors a new release adds.
+      # The ai-agent-action suite from agent-evidence-vectors, pinned to the
+      # commit of a release tag. Raise both to take the vectors a new release adds.
       - uses: actions/checkout@v4
         with:
           repository: probityai/agent-evidence-vectors
-          ref: v0.13.0
+          ref: e7508ced37dacc89decacd857e97930860ee08cd # v0.25.0
           path: agent-evidence-vectors
 
       - uses: dtolnay/rust-toolchain@stable
